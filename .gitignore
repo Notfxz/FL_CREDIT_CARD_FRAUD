@@ -1,0 +1,5 @@
+client_sequences/
+.ipynb_checkpoints/
+__pycache__/
+*.npz
+final_federated_model.h5
