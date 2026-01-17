@@ -1,152 +1,78 @@
-# =====================================
-# Client 2 – Federated Learning Client
-# =====================================
-
 import json
 import numpy as np
 import flwr as fl
-
+import os
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import roc_auc_score, recall_score, accuracy_score
-from sklearn.utils.class_weight import compute_class_weight
-
 from model.fraud_lstm import build_model
 
-
-# =====================================
-# Load data (RAM safe)
-# =====================================
+# 1. Load data
+# CHANGE THIS TO client_2_seq.npz for the second client script
 data = np.load("client_sequences/client_2_seq.npz", mmap_mode="r")
 X, y = data["X"], data["y"]
 
-# =====================================
-# Controlled sampling
-# =====================================
-MAX_SAMPLES = 60000
-FRAUD_RATIO = 0.25
-
+# 2. Aggressive Balanced Sampling
+MAX_SAMPLES = 2000 
+FRAUD_RATIO = 0.5 # 50/50 split to force the model to see more fraud
 fraud_idx = np.where(y == 1)[0]
 normal_idx = np.where(y == 0)[0]
 
 num_fraud = min(len(fraud_idx), int(MAX_SAMPLES * FRAUD_RATIO))
 num_normal = MAX_SAMPLES - num_fraud
 
-fraud_sample = np.random.choice(fraud_idx, num_fraud, replace=False)
-normal_sample = np.random.choice(normal_idx, num_normal, replace=False)
-
-selected_idx = np.concatenate([fraud_sample, normal_sample])
+selected_idx = np.concatenate([
+    np.random.choice(fraud_idx, num_fraud, replace=False),
+    np.random.choice(normal_idx, num_normal, replace=False)
+])
 np.random.shuffle(selected_idx)
+X, y = X[selected_idx], y[selected_idx]
 
-X = X[selected_idx]
-y = y[selected_idx]
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2)
 
-# =====================================
-# Train / Test split
-# =====================================
-X_train, X_test, y_train, y_test = train_test_split(
-    X, y, test_size=0.2, random_state=42
-)
+# 3. Aggressive Class Weights (The "Hammer" Fix for Recall)
+# We tell the model that missing 1 Fraud is 15x worse than a false alarm
+class_weights = {0: 1.0, 1: 15.0}
 
-# =====================================
-# Class weights
-# =====================================
-classes = np.unique(y_train)
-class_weights = compute_class_weight(
-    class_weight="balanced",
-    classes=classes,
-    y=y_train
-)
-class_weights = dict(zip(classes, class_weights))
-
-# =====================================
-# Build model
-# =====================================
+# 4. Build Model
 model = build_model(X_train.shape[1:])
 
-
-# =====================================
-# Flower Client
-# =====================================
 class FraudClient(fl.client.NumPyClient):
-
     def get_parameters(self, config):
         return model.get_weights()
 
     def fit(self, parameters, config):
         model.set_weights(parameters)
-
-        model.fit(
-            X_train,
-            y_train,
-            epochs=5,
-            batch_size=32,
-            class_weight=class_weights,
-            verbose=0
-        )
-
+        # Smaller batch_size (32) helps the model learn minority patterns better
+        model.fit(X_train, y_train, epochs=10, batch_size=32, 
+                  class_weight=class_weights, verbose=1)
         return model.get_weights(), len(X_train), {}
 
     def evaluate(self, parameters, config):
         model.set_weights(parameters)
-
         y_pred = model.predict(X_test, verbose=0).ravel()
-
-        thresholds = [0.3, 0.4, 0.5, 0.6]
-        MIN_RECALL = 0.6
-
-        best_score = -1
+        
+        # Recall-First Thresholding: We check multiple thresholds and pick the best recall
+        best_rec = 0
         best_metrics = {}
-
-        for t in thresholds:
+        
+        for t in [0.2, 0.3, 0.4, 0.5]:
             y_label = (y_pred > t).astype(int)
-
-            acc = accuracy_score(y_test, y_label)
             rec = recall_score(y_test, y_label)
+            acc = accuracy_score(y_test, y_label)
             auc = roc_auc_score(y_test, y_pred)
+            
+            if rec >= best_rec: # Prioritize the threshold that catches more fraud
+                best_rec = rec
+                best_metrics = {"accuracy": float(acc), "recall": float(rec), "auc": float(auc), "threshold": t}
 
-            if rec < MIN_RECALL:
-                continue
-
-            score = auc + acc
-
-            if score > best_score:
-                best_score = score
-                best_metrics = {
-                    "accuracy": acc,
-                    "recall": rec,
-                    "auc": auc,
-                    "threshold": t
-                }
-
-        if not best_metrics:
-            best_metrics = {
-                "accuracy": accuracy_score(y_test, (y_pred > 0.3).astype(int)),
-                "recall": recall_score(y_test, (y_pred > 0.3).astype(int)),
-                "auc": roc_auc_score(y_test, y_pred),
-                "threshold": 0.3
-            }
-
-        loss, _ = model.evaluate(X_test, y_test, verbose=0)
-
-        print(
-            f"📊 Client-2 Best | "
-            f"AUC: {best_metrics['auc']:.4f} | "
-            f"Recall: {best_metrics['recall']:.4f} | "
-            f"Accuracy: {best_metrics['accuracy']:.4f} | "
-            f"Threshold: {best_metrics['threshold']}"
-        )
-
-        # ✅ SAVE METRICS
+        print(f"📊 Client Metrics | AUC: {best_metrics['auc']:.4f} | RECALL: {best_metrics['recall']:.4f} | Acc: {best_metrics['accuracy']:.4f}")
+        
+        # CHANGE TO client2_metrics.json for the second client script
         with open("client2_metrics.json", "w") as f:
             json.dump(best_metrics, f)
+            
+        loss, _ = model.evaluate(X_test, y_test, verbose=0)
+        return float(loss), len(X_test), best_metrics
 
-        return loss, len(X_test), best_metrics
-
-
-# =====================================
-# Start Flower Client
-# =====================================
-fl.client.start_numpy_client(
-    server_address="localhost:8080",
-    client=FraudClient()
-)
+if __name__ == "__main__":
+    fl.client.start_numpy_client(server_address="localhost:8080", client=FraudClient())

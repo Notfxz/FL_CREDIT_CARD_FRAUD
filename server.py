@@ -1,48 +1,30 @@
 import flwr as fl
-import tensorflow as tf
-from flwr.common import parameters_to_ndarrays
+import os
 from model.fraud_lstm import build_model
 
-# -------------------------
-# CONFIG
-# -------------------------
-NUM_ROUNDS = 3
-INPUT_SHAPE = (5, 401)  # (SEQ_LEN, FEATURES)
-
-# -------------------------
-# Custom Strategy
-# -------------------------
 class SaveModelStrategy(fl.server.strategy.FedAvg):
-
     def __init__(self):
-        super().__init__()
-        self.model = build_model(INPUT_SHAPE)
+        super().__init__(
+            min_fit_clients=2,           # Wait for both clients to start training
+            min_available_clients=2,     # Wait for both clients to connect
+            min_evaluate_clients=2,      # Wait for both clients to evaluate
+        )
+        self.model = build_model((5, 401))
 
     def aggregate_fit(self, server_round, results, failures):
-        aggregated = super().aggregate_fit(server_round, results, failures)
+        aggregated_weights = super().aggregate_fit(server_round, results, failures)
+        if aggregated_weights is not None:
+            print(f"Saving round {server_round} weights...")
+            self.model.set_weights(fl.common.parameters_to_ndarrays(aggregated_weights[0]))
+            self.model.save("final_federated_model.h5")
+        return aggregated_weights
 
-        if aggregated is not None:
-            parameters, _ = aggregated
-
-            # ✅ Convert Parameters → NumPy arrays
-            weights = parameters_to_ndarrays(parameters)
-
-            self.model.set_weights(weights)
-
-            # ✅ Save model after final round
-            if server_round == NUM_ROUNDS:
-                self.model.save("final_federated_model.h5")
-                print("\n✅ Final federated model saved as final_federated_model.h5\n")
-
-        return aggregated
-
-# -------------------------
-# Start Server
-# -------------------------
 strategy = SaveModelStrategy()
 
-fl.server.start_server(
-    server_address="localhost:8080",
-    config=fl.server.ServerConfig(num_rounds=NUM_ROUNDS),
-    strategy=strategy
-)
+if __name__ == "__main__":
+    print("Server starting on port 8080...")
+    fl.server.start_server(
+        server_address="0.0.0.0:8080",
+        config=fl.server.ServerConfig(num_rounds=10),
+        strategy=strategy
+    )
